@@ -6,12 +6,16 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"strings"
 
 	"github.com/pingcap/go-tpc/tpcc"
 	"github.com/spf13/cobra"
 )
 
-var tpccConfig tpcc.Config
+var (
+	tpccConfig      tpcc.Config
+	specifiedTables string
+)
 
 func executeTpcc(action string) {
 	if pprofAddr != "" {
@@ -20,18 +24,22 @@ func executeTpcc(action string) {
 		}()
 	}
 
+	chooseTable := len(specifiedTables) > 0
 	if tpccConfig.OutputDir == "" {
 		if err := openDB(); err != nil {
 			os.Exit(1)
 		}
 		defer closeDB()
 
-		if len(tpccConfig.Tables) > 0 {
+		if chooseTable {
 			fmt.Println("Cannot specify generated tables when csv.output flag not set")
 			os.Exit(1)
 		}
 	}
 
+	if chooseTable {
+		tpccConfig.SpecifiedTables = strings.Split(specifiedTables, ",")
+	}
 	tpccConfig.DBName = dbName
 	tpccConfig.Threads = threads
 	tpccConfig.Isolation = isolationLevel
@@ -56,8 +64,8 @@ func registerTpcc(root *cobra.Command) {
 	cmd.PersistentFlags().IntVar(&tpccConfig.Warehouses, "warehouses", 10, "Number of warehouses")
 	cmd.PersistentFlags().BoolVar(&tpccConfig.CheckAll, "check-all", false, "Run all consistency checks")
 	cmd.PersistentFlags().StringVar(&tpccConfig.OutputDir, "csv.output", "", "Output directory for generating csv file when preparing data")
-	cmd.PersistentFlags().StringArrayVar(&tpccConfig.Tables, "csv.table", []string{}, "Specified tables for " +
-		"generating csv file(repeated), valid only if csv.output is set. If this flag is not set, generate all tables by default.")
+	cmd.PersistentFlags().StringVar(&specifiedTables, "csv.tables", "", "Specified tables for "+
+		"generating csv file, separated by ','. Valid only if csv.output is set. If this flag is not set, generate all tables by default.")
 
 	var cmdPrepare = &cobra.Command{
 		Use:   "prepare",
