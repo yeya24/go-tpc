@@ -86,11 +86,7 @@ func NewCSVBatchLoader(f *os.File) *CSVBatchLoader {
 func (b *CSVBatchLoader) InsertValue(ctx context.Context, columns []string) error {
 	b.buf = append(b.buf, columns)
 
-	if len(b.buf) >= maxBatchCount {
-		return b.Flush(ctx)
-	}
-
-	return nil
+	return b.Flush(ctx)
 }
 
 // Flush inserts all pending values
@@ -101,7 +97,6 @@ func (b *CSVBatchLoader) Flush(ctx context.Context) error {
 
 	err := b.writer.WriteAll(b.buf)
 	b.buf = b.buf[:0]
-	b.writer.Flush()
 
 	return err
 }
