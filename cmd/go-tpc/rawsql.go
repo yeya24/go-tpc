@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pingcap/go-tpc/pkg/util"
 	"github.com/pingcap/go-tpc/rawsql"
 	"github.com/spf13/cobra"
 )
@@ -29,13 +30,29 @@ func registerRawsql(root *cobra.Command) {
 		Short: "Run workload",
 		Run: func(cmd *cobra.Command, args []string) {
 			if len(queryFiles) == 0 {
-				fmt.Fprintln(os.Stderr, "empty query files")
+				util.StdErrLogger.Printf("empty query files")
 				os.Exit(1)
 			}
 
 			execRawsql("run")
 		},
 	}
+
+	cmdRun.PersistentFlags().BoolVar(&rawsqlConfig.EnablePlanReplayer,
+		"use-plan-replayer",
+		false,
+		"Use Plan Replayer to dump stats and variables before running queries")
+
+	cmdRun.PersistentFlags().StringVar(&rawsqlConfig.PlanReplayerConfig.PlanReplayerDir,
+		"plan-replayer-dir",
+		"",
+		"Dir of Plan Replayer file dumps")
+
+	cmdRun.PersistentFlags().StringVar(&rawsqlConfig.PlanReplayerConfig.PlanReplayerFileName,
+		"plan-replayer-file",
+		"",
+		"Name of plan Replayer file dumps")
+
 	cmdRun.PersistentFlags().StringVar(&queryFiles,
 		"query-files",
 		"",
@@ -58,19 +75,22 @@ func execRawsql(action string) {
 
 	// if globalDB == nil
 	if globalDB == nil {
-		fmt.Fprintln(os.Stderr, "cannot connect to the database")
+		util.StdErrLogger.Printf("cannot connect to the database")
 		os.Exit(1)
 	}
 
+	rawsqlConfig.OutputStyle = outputStyle
 	rawsqlConfig.DBName = dbName
 	rawsqlConfig.QueryNames = strings.Split(queryFiles, ",")
 	rawsqlConfig.Queries = make(map[string]string, len(rawsqlConfig.QueryNames))
 	rawsqlConfig.RefreshWait = refreshConnWait
+	rawsqlConfig.PlanReplayerConfig.Host = hosts[0]
+	rawsqlConfig.PlanReplayerConfig.StatusPort = statusPort
 
 	for i, filename := range rawsqlConfig.QueryNames {
 		queryData, err := ioutil.ReadFile(filename)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "read file: %s, err: %v\n", filename, err)
+			util.StdErrLogger.Printf("read file: %s, err: %v\n", filename, err)
 			os.Exit(1)
 		}
 

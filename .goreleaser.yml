@@ -2,6 +2,7 @@
 env:
   - GO111MODULE=on
   - CGO_ENABLED=0
+  - GOEXPERIMENT=jsonv2
 before:
   hooks:
     - go mod tidy
@@ -11,6 +12,7 @@ builds:
     main: ./cmd/go-tpc/
     goarch:
       - amd64
+      - arm64
     goos:
       - linux
       - darwin

@@ -37,10 +37,17 @@ func checkPrepare(ctx context.Context, w workload.Workloader) {
 	wg.Wait()
 }
 
-func execute(ctx context.Context, w workload.Workloader, action string, threads, index int) error {
+func execute(timeoutCtx context.Context, w workload.Workloader, action string, threads, index int) error {
 	count := totalCount / threads
 
-	ctx = w.InitThread(ctx, index)
+	// For prepare, cleanup and check operations, use background context to avoid timeout constraints
+	// Only run phases should be limited by timeout
+	var ctx context.Context
+	if action == "prepare" || action == "cleanup" || action == "check" {
+		ctx = w.InitThread(context.Background(), index)
+	} else {
+		ctx = w.InitThread(timeoutCtx, index)
+	}
 	defer w.CleanupThread(ctx, index)
 
 	switch action {
@@ -58,16 +65,30 @@ func execute(ctx context.Context, w workload.Workloader, action string, threads,
 		return w.Check(ctx, index)
 	}
 
+	// This loop is only reached for "run" action since other actions return earlier
 	for i := 0; i < count || count <= 0; i++ {
-		err := w.Run(ctx, index)
-
+		// Check if timeout has occurred before starting next query
 		select {
 		case <-ctx.Done():
+			if !silence {
+				fmt.Printf("[%s] %s worker %d stopped due to timeout after %d iterations\n",
+					time.Now().Format("2006-01-02 15:04:05"), action, index, i)
+			}
 			return nil
 		default:
 		}
 
+		err := w.Run(ctx, index)
 		if err != nil {
+			// Check if the error is due to timeout/cancellation
+			if ctx.Err() != nil {
+				if !silence {
+					fmt.Printf("[%s] %s worker %d stopped due to timeout: %v\n",
+						time.Now().Format("2006-01-02 15:04:05"), action, index, err)
+				}
+				return nil // Don't treat timeout as an error
+			}
+
 			if !silence {
 				fmt.Printf("[%s] execute %s failed, err %v\n", time.Now().Format("2006-01-02 15:04:05"), action, err)
 			}
@@ -100,6 +121,54 @@ func executeWorkload(ctx context.Context, w workload.Workloader, threads int, ac
 			}
 		}
 	}()
+	if w.Name() == "tpch" && action == "run" {
+		err := w.Exec(`create or replace view revenue0 (supplier_no, total_revenue) as
+	select
+		l_suppkey,
+		sum(l_extendedprice * (1 - l_discount))
+	from
+		lineitem
+	where
+		l_shipdate >= '1997-07-01'
+		and l_shipdate < date_add('1997-07-01', interval '3' month)
+	group by
+		l_suppkey;`)
+		if err != nil {
+			panic(fmt.Sprintf("a fatal occurred when preparing view data: %v", err))
+		}
+	}
+	// CH benchmark requires the revenue1 view for analytical queries.
+	// During normal prepare flow, this view is created in prepareView() method.
+	// However, when using CSV data ingestion, the prepare stage is skipped and
+	// the view won't exist. So we create it here when action is "run" to ensure
+	// the view is available regardless of how data was loaded.
+	if w.Name() == "ch" && action == "run" {
+		err := w.Exec(`create or replace view revenue1 (supplier_no, total_revenue) as (
+    select	mod((s_w_id * s_i_id),10000) as supplier_no,
+              sum(ol_amount) as total_revenue
+    from	order_line, stock
+    where ol_i_id = s_i_id and ol_supply_w_id = s_w_id
+      and ol_delivery_d >= '2007-01-02 00:00:00.000000'
+    group by mod((s_w_id * s_i_id),10000));`)
+		if err != nil {
+			panic(fmt.Sprintf("a fatal occurred when preparing view data: %v", err))
+		}
+	}
+	enabledDumpPlanReplayer := w.IsPlanReplayerDumpEnabled()
+	if enabledDumpPlanReplayer {
+		err := w.PreparePlanReplayerDump()
+		if err != nil {
+			fmt.Printf("[%s] prepare plan replayer failed, err%v\n",
+				time.Now().Format("2006-01-02 15:04:05"), err)
+		}
+		defer func() {
+			err = w.FinishPlanReplayerDump()
+			if err != nil {
+				fmt.Printf("[%s] dump plan replayer failed, err%v\n",
+					time.Now().Format("2006-01-02 15:04:05"), err)
+			}
+		}()
+	}
 
 	for i := 0; i < threads; i++ {
 		go func(index int) {

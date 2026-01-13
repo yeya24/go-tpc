@@ -42,7 +42,7 @@ func NewCSVWorkloader(db *sql.DB, cfg *Config) (*CSVWorkLoader, error) {
 		cfg:          cfg,
 		initLoadTime: time.Now().Format(timeFormat),
 		tables:       make(map[string]bool),
-		ddlManager:   newDDLManager(cfg.Parts, cfg.UseFK, cfg.Warehouses, cfg.PartitionType),
+		ddlManager:   newDDLManager(cfg.Parts, cfg.UseFK, cfg.Warehouses, cfg.PartitionType, cfg.UseClusteredIndex),
 	}
 
 	var val bool
@@ -118,7 +118,7 @@ func (c *CSVWorkLoader) CleanupThread(ctx context.Context, _ int) {
 func (c *CSVWorkLoader) Prepare(ctx context.Context, threadID int) error {
 	if c.db != nil {
 		if threadID == 0 {
-			if err := c.ddlManager.createTables(ctx); err != nil {
+			if err := c.ddlManager.createTables(ctx, c.cfg.Driver); err != nil {
 				return err
 			}
 		}
@@ -486,4 +486,20 @@ func (c *CSVWorkLoader) loadOrderLine(ctx context.Context, warehouse int,
 	}
 
 	return l.Flush(ctx)
+}
+
+func (c *CSVWorkLoader) IsPlanReplayerDumpEnabled() bool {
+	return false
+}
+
+func (c *CSVWorkLoader) PreparePlanReplayerDump() error {
+	return nil
+}
+
+func (c *CSVWorkLoader) FinishPlanReplayerDump() error {
+	return nil
+}
+
+func (c *CSVWorkLoader) Exec(sql string) error {
+	return nil
 }

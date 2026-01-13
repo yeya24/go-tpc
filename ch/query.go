@@ -15,7 +15,7 @@ where	 ol_delivery_d > '2007-01-02 00:00:00.000000'
 group by ol_number order by ol_number;
 `
 	q2 = `
-/*PLACEHOLDER*/ /*q1*/select 	 s_suppkey, s_name, n_name, i_id, i_name, s_address, s_phone, s_comment
+/*PLACEHOLDER*/ /*q2*/select 	 s_suppkey, s_name, n_name, i_id, i_name, s_address, s_phone, s_comment
 from	 item, supplier, stock, nation, region,
          (select s_i_id as m_i_id,
                  min(s_quantity) as m_s_quantity
@@ -142,7 +142,6 @@ where	 i_id = s_i_id
   and r_name = 'ASIA'
   and s_nationkey = n2.n_nationkey
   and o_entry_d between '2007-01-02 00:00:00.000000' and '2032-01-02 00:00:00.000000'
-#   and i_data like '%a'
   and i_id = ol_i_id
 group by extract(year from o_entry_d)
 order by l_year;

@@ -2,24 +2,36 @@ package main
 
 import (
 	"context"
+	"crypto/sha1"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
+	sqldrv "database/sql/driver"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
+	"github.com/pingcap/go-tpc/pkg/util"
 	"github.com/spf13/cobra"
+	_ "go.uber.org/automaxprocs"
 
 	// mysql package
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/go-sql-driver/mysql"
+	// pg
+	"github.com/lib/pq"
 )
 
 var (
 	dbName         string
-	host           string
-	port           int
+	hosts          []string
+	ports          []int
+	statusPort     int
 	user           string
 	password       string
 	threads        int
@@ -36,16 +48,106 @@ var (
 	metricsAddr    string
 	maxProcs       int
 	connParams     string
+	outputStyle    string
+	targets        []string
+	sslCA          string
+	sslCert        string
+	sslKey         string
 
 	globalDB  *sql.DB
 	globalCtx context.Context
 )
 
 const (
-	unknownDB   = "Unknown database"
-	createDBDDL = "CREATE DATABASE IF NOT EXISTS "
-	mysqlDriver = "mysql"
+	createDBDDL   = "CREATE DATABASE "
+	mysqlDriver   = "mysql"
+	pgDriver      = "postgres"
+	customTlsName = "custom"
 )
+
+type MuxDriver struct {
+	cursor    uint64
+	instances []string
+	internal  sqldrv.Driver
+}
+
+func (drv *MuxDriver) Open(name string) (sqldrv.Conn, error) {
+	k := atomic.AddUint64(&drv.cursor, 1)
+	return drv.internal.Open(drv.instances[int(k)%len(drv.instances)])
+}
+
+func makeTargets(hosts []string, ports []int) []string {
+	targets := make([]string, 0, len(hosts)*len(ports))
+	for _, host := range hosts {
+		for _, port := range ports {
+			targets = append(targets, host+":"+strconv.Itoa(port))
+		}
+	}
+	return targets
+}
+
+func newDB(targets []string, driver string, user string, password string, dbName string, connParams string) (*sql.DB, error) {
+	if len(targets) == 0 {
+		panic(fmt.Errorf("empty targets"))
+	}
+	var (
+		drv   sqldrv.Driver
+		hash  = sha1.New()
+		names = make([]string, len(targets))
+	)
+	hash.Write([]byte(driver))
+	hash.Write([]byte(user))
+	hash.Write([]byte(password))
+	hash.Write([]byte(dbName))
+	hash.Write([]byte(connParams))
+
+	if driver == mysqlDriver && (len(sslCA) > 0 || len(sslCert) > 0 || len(sslKey) > 0) {
+		registerMysqlTLSConfig()
+	}
+
+	for i, addr := range targets {
+		hash.Write([]byte(addr))
+		switch driver {
+		case mysqlDriver:
+			var tlsName string = "preferred"
+			if len(sslCA) > 0 {
+				tlsName = customTlsName
+			}
+			// allow multiple statements in one query to allow q15 on the TPC-H
+			dsn := fmt.Sprintf("%s:%s@tcp(%s)/%s?multiStatements=true&tls=%s", user, password, addr, dbName, tlsName)
+			if len(connParams) > 0 {
+				dsn = dsn + "&" + connParams
+			}
+			names[i] = dsn
+			drv = &mysql.MySQLDriver{}
+		case pgDriver:
+			if len(sslCA) > 0 || len(sslKey) > 0 || len(sslCert) > 0 {
+				panic("postgresql driver doesn't support TLS yet")
+			}
+
+			dsn := fmt.Sprintf("postgres://%s:%s@%s/%s", user, password, addr, dbName)
+			if len(connParams) > 0 {
+				dsn = dsn + "?" + connParams
+			}
+			names[i] = dsn
+			drv = &pq.Driver{}
+		default:
+			panic(fmt.Errorf("unknown driver: %q", driver))
+		}
+	}
+
+	if len(names) == 1 {
+		return sql.Open(driver, names[0])
+	}
+	drvName := driver + "+" + hex.EncodeToString(hash.Sum(nil))
+	for _, n := range sql.Drivers() {
+		if n == drvName {
+			return sql.Open(drvName, "")
+		}
+	}
+	sql.Register(drvName, &MuxDriver{instances: names, internal: drv})
+	return sql.Open(drvName, "")
+}
 
 func closeDB() {
 	if globalDB != nil {
@@ -55,31 +157,23 @@ func closeDB() {
 }
 
 func openDB() {
-	// TODO: support other drivers
 	var (
 		tmpDB *sql.DB
 		err   error
-		ds    = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s", user, password, host, port, dbName)
 	)
-	// allow multiple statements in one query to allow q15 on the TPC-H
-	fullDsn := fmt.Sprintf("%s?multiStatements=true", ds)
-	if len(connParams) > 0 {
-		fullDsn = fmt.Sprintf("%s&%s", fullDsn, connParams)
-	}
-	globalDB, err = sql.Open(mysqlDriver, fullDsn)
+	globalDB, err = newDB(targets, driver, user, password, dbName, connParams)
 	if err != nil {
 		panic(err)
 	}
 	if err := globalDB.Ping(); err != nil {
-		errString := err.Error()
-		if strings.Contains(errString, unknownDB) {
-			tmpDs := fmt.Sprintf("%s:%s@tcp(%s:%d)/", user, password, host, port)
-			tmpDB, _ = sql.Open(mysqlDriver, tmpDs)
+		if isDBNotExist(err) {
+			tmpDB, _ = newDB(targets, driver, user, password, "", connParams)
 			defer tmpDB.Close()
 			if _, err := tmpDB.Exec(createDBDDL + dbName); err != nil {
-				panic(fmt.Errorf("failed to create database, err %v\n", err))
+				panic(fmt.Errorf("failed to create database, err %v", err))
 			}
 		} else {
+			fmt.Printf("failed to ping db, err %v\n", err)
 			globalDB = nil
 		}
 	} else {
@@ -87,22 +181,42 @@ func openDB() {
 	}
 }
 
+func isDBNotExist(err error) bool {
+	if err == nil {
+		return false
+	}
+	switch driver {
+	case mysqlDriver:
+		return strings.Contains(err.Error(), "Unknown database")
+	case pgDriver:
+		msg := err.Error()
+		return strings.HasPrefix(msg, "pq: database") && strings.HasSuffix(msg, "does not exist")
+	}
+	return false
+}
+
 func main() {
 	var rootCmd = &cobra.Command{
 		Use:   "go-tpc",
 		Short: "Benchmark database with different workloads",
+		PersistentPreRun: func(cmd *cobra.Command, args []string) {
+			if len(targets) == 0 {
+				targets = makeTargets(hosts, ports)
+			}
+		},
 	}
 	rootCmd.PersistentFlags().IntVar(&maxProcs, "max-procs", 0, "runtime.GOMAXPROCS")
 	rootCmd.PersistentFlags().StringVar(&pprofAddr, "pprof", "", "Address of pprof endpoint")
 	rootCmd.PersistentFlags().StringVar(&metricsAddr, "metrics-addr", "", "Address of metrics endpoint")
 	rootCmd.PersistentFlags().StringVarP(&dbName, "db", "D", "test", "Database name")
-	rootCmd.PersistentFlags().StringVarP(&host, "host", "H", "127.0.0.1", "Database host")
+	rootCmd.PersistentFlags().StringSliceVarP(&hosts, "host", "H", []string{"127.0.0.1"}, "Database host")
 	rootCmd.PersistentFlags().StringVarP(&user, "user", "U", "root", "Database user")
 	rootCmd.PersistentFlags().StringVarP(&password, "password", "p", "", "Database password")
-	rootCmd.PersistentFlags().IntVarP(&port, "port", "P", 4000, "Database port")
+	rootCmd.PersistentFlags().IntSliceVarP(&ports, "port", "P", []int{4000}, "Database port")
+	rootCmd.PersistentFlags().IntVarP(&statusPort, "statusPort", "S", 10080, "Database status port")
 	rootCmd.PersistentFlags().IntVarP(&threads, "threads", "T", 1, "Thread concurrency")
 	rootCmd.PersistentFlags().IntVarP(&acThreads, "acThreads", "t", 1, "OLAP client concurrency, only for CH-benCHmark")
-	rootCmd.PersistentFlags().StringVarP(&driver, "driver", "d", "", "Database driver: mysql")
+	rootCmd.PersistentFlags().StringVarP(&driver, "driver", "d", mysqlDriver, "Database driver: mysql, postgres")
 	rootCmd.PersistentFlags().DurationVar(&totalTime, "time", 1<<63-1, "Total execution time")
 	rootCmd.PersistentFlags().IntVar(&totalCount, "count", 0, "Total execution count, 0 means infinite")
 	rootCmd.PersistentFlags().BoolVar(&dropData, "dropdata", false, "Cleanup data before prepare")
@@ -112,7 +226,13 @@ func main() {
 	rootCmd.PersistentFlags().IntVar(&isolationLevel, "isolation", 0, `Isolation Level 0: Default, 1: ReadUncommitted,
 2: ReadCommitted, 3: WriteCommitted, 4: RepeatableRead,
 5: Snapshot, 6: Serializable, 7: Linerizable`)
-	rootCmd.PersistentFlags().StringVar(&connParams, "conn-params", "", "session variables")
+	rootCmd.PersistentFlags().StringVar(&connParams, "conn-params", "", "session variables, e.g. for TiDB --conn-params tidb_isolation_read_engines='tiflash', For PostgreSQL: --conn-params sslmode=disable")
+	rootCmd.PersistentFlags().StringVar(&outputStyle, "output", util.OutputStylePlain, "output style, valid values can be { plain | table | json }")
+	rootCmd.PersistentFlags().StringSliceVar(&targets, "targets", nil, "Target database addresses")
+	rootCmd.PersistentFlags().MarkHidden("targets")
+	rootCmd.PersistentFlags().StringVar(&sslCA, "ssl-ca", "", "Path of file that contains list of trusted SSL CAs for connection")
+	rootCmd.PersistentFlags().StringVar(&sslCert, "ssl-cert", "", "Path of file that contains X509 certificate in PEM format for connection")
+	rootCmd.PersistentFlags().StringVar(&sslKey, "ssl-key", "", "Path of file that contains X509 key in PEM format for connection")
 
 	cobra.EnablePrefixMatching = true
 
@@ -154,4 +274,44 @@ func main() {
 	rootCmd.Execute()
 
 	cancel()
+}
+
+// registerMysqlTLSConfig constructs a `*tls.Config` from the CA, certification and key
+// paths, and register to mysql client.
+func registerMysqlTLSConfig() {
+	// Load the client certificates from disk
+	var certificates []tls.Certificate
+	if len(sslCert) != 0 && len(sslKey) != 0 {
+		cert, err := tls.LoadX509KeyPair(sslCert, sslKey)
+		if err != nil {
+			panic(fmt.Errorf("could not load client key pair, err %v", err))
+		}
+		certificates = []tls.Certificate{cert}
+	} else if len(sslCert) > 0 || len(sslKey) > 0 {
+		panic("incomplete key pair configuration")
+	}
+
+	// Create a certificate pool from CA
+	certPool := x509.NewCertPool()
+	ca, err := os.ReadFile(sslCA)
+	if err != nil {
+		panic(fmt.Errorf("could not read CA certificate, err %v", err))
+	}
+
+	// Append the certificates from the CA
+	if !certPool.AppendCertsFromPEM(ca) {
+		panic("failed to append CA certs")
+	}
+
+	tlsConfig := &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: certificates,
+		RootCAs:      certPool,
+		ClientCAs:    certPool,
+	}
+
+	err = mysql.RegisterTLSConfig(customTlsName, tlsConfig)
+	if err != nil {
+		panic(fmt.Errorf("failed to register TLS config, err %v", err))
+	}
 }

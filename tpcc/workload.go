@@ -13,6 +13,7 @@ import (
 
 	"github.com/pingcap/go-tpc/pkg/measurement"
 	"github.com/pingcap/go-tpc/pkg/sink"
+	"github.com/pingcap/go-tpc/pkg/util"
 	"github.com/pingcap/go-tpc/pkg/workload"
 )
 
@@ -42,6 +43,9 @@ type tpccState struct {
 	deliveryStmts    map[string]*sql.Stmt
 	stockLevelStmt   map[string]*sql.Stmt
 	paymentStmts     map[string]*sql.Stmt
+
+	// for automatic connection refresh
+	lastConnRefresh time.Time
 }
 
 const (
@@ -53,6 +57,7 @@ const (
 
 // Config is the configuration for tpcc workload
 type Config struct {
+	Driver        string
 	DBName        string
 	Threads       int
 	Parts         int
@@ -72,13 +77,20 @@ type Config struct {
 	MaxMeasureLatency time.Duration
 
 	// for prepare sub-command only
-	OutputType      string
-	OutputDir       string
-	SpecifiedTables string
+	OutputType        string
+	OutputDir         string
+	SpecifiedTables   string
+	UseClusteredIndex bool
 
 	// connection, retry count when commiting statement fails, default 0
 	PrepareRetryCount    int
 	PrepareRetryInterval time.Duration
+
+	// output style
+	OutputStyle string
+
+	// automatic connection refresh interval to balance traffic across new replicas
+	ConnRefreshInterval time.Duration
 }
 
 // Workloader is TPCC workload
@@ -135,7 +147,7 @@ func NewWorkloader(db *sql.DB, cfg *Config) (workload.Workloader, error) {
 		db:                  db,
 		cfg:                 cfg,
 		initLoadTime:        time.Now().Format(timeFormat),
-		ddlManager:          newDDLManager(cfg.Parts, cfg.UseFK, cfg.Warehouses, cfg.PartitionType),
+		ddlManager:          newDDLManager(cfg.Parts, cfg.UseFK, cfg.Warehouses, cfg.PartitionType, cfg.UseClusteredIndex),
 		rtMeasurement:       measurement.NewMeasurement(resetMaxLat),
 		waitTimeMeasurement: measurement.NewMeasurement(resetMaxLat),
 	}
@@ -163,9 +175,10 @@ func (w *Workloader) Name() string {
 // InitThread implements Workloader interface
 func (w *Workloader) InitThread(ctx context.Context, threadID int) context.Context {
 	s := &tpccState{
-		TpcState: workload.NewTpcState(ctx, w.db),
-		index:    0,
-		decks:    make([]int, 0, 23),
+		TpcState:        workload.NewTpcState(ctx, w.db),
+		index:           0,
+		decks:           make([]int, 0, 23),
+		lastConnRefresh: time.Now(),
 	}
 
 	for index, txn := range w.txns {
@@ -193,7 +206,7 @@ func (w *Workloader) CleanupThread(ctx context.Context, threadID int) {
 	if s.Conn != nil {
 		s.Conn.Close()
 	}
-	for k, _ := range s.loaders {
+	for k := range s.loaders {
 		s.loaders[k].Close(ctx)
 	}
 }
@@ -202,7 +215,7 @@ func (w *Workloader) CleanupThread(ctx context.Context, threadID int) {
 func (w *Workloader) Prepare(ctx context.Context, threadID int) error {
 	if w.db != nil {
 		if threadID == 0 {
-			if err := w.ddlManager.createTables(ctx); err != nil {
+			if err := w.ddlManager.createTables(ctx, w.cfg.Driver); err != nil {
 				return err
 			}
 		}
@@ -219,65 +232,91 @@ func getTPCCState(ctx context.Context) *tpccState {
 }
 
 // Run implements Workloader interface
-func (w *Workloader) Run(ctx context.Context, threadID int) error {
+func (w *Workloader) Run(ctx context.Context, threadID int) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic in TPC-C Run (thread %d): %v", threadID, r)
+		}
+	}()
+
 	s := getTPCCState(ctx)
 	refreshConn := false
-	if err := s.Conn.PingContext(ctx); err != nil {
-		if err := s.RefreshConn(ctx); err != nil {
-			return err
+
+	// Helper function to safely refresh connection with panic recovery
+	safeRefreshConn := func() error {
+		defer func() {
+			if r := recover(); r != nil {
+				err = fmt.Errorf("panic during connection refresh (thread %d): %v", threadID, r)
+			}
+		}()
+		return s.RefreshConn(ctx)
+	}
+
+	// Check if automatic connection refresh is needed
+	if w.cfg.ConnRefreshInterval > 0 && time.Since(s.lastConnRefresh) >= w.cfg.ConnRefreshInterval {
+		if err := safeRefreshConn(); err != nil {
+			return fmt.Errorf("automatic connection refresh failed (thread %d): %w", threadID, err)
 		}
+		s.lastConnRefresh = time.Now()
+		refreshConn = true
+	} else if err := s.Conn.PingContext(ctx); err != nil {
+		// Fallback to ping-based refresh if automatic refresh didn't happen
+		if err := safeRefreshConn(); err != nil {
+			return fmt.Errorf("ping-based connection refresh failed (thread %d): %w", threadID, err)
+		}
+		s.lastConnRefresh = time.Now()
 		refreshConn = true
 	}
 	if s.newOrderStmts == nil || refreshConn {
 		s.newOrderStmts = map[string]*sql.Stmt{
-			newOrderSelectCustomer: prepareStmt(ctx, s.Conn, newOrderSelectCustomer),
-			newOrderSelectDistrict: prepareStmt(ctx, s.Conn, newOrderSelectDistrict),
-			newOrderUpdateDistrict: prepareStmt(ctx, s.Conn, newOrderUpdateDistrict),
-			newOrderInsertOrder:    prepareStmt(ctx, s.Conn, newOrderInsertOrder),
-			newOrderInsertNewOrder: prepareStmt(ctx, s.Conn, newOrderInsertNewOrder),
+			newOrderSelectCustomer: prepareStmt(w.cfg.Driver, ctx, s.Conn, newOrderSelectCustomer),
+			newOrderSelectDistrict: prepareStmt(w.cfg.Driver, ctx, s.Conn, newOrderSelectDistrict),
+			newOrderUpdateDistrict: prepareStmt(w.cfg.Driver, ctx, s.Conn, newOrderUpdateDistrict),
+			newOrderInsertOrder:    prepareStmt(w.cfg.Driver, ctx, s.Conn, newOrderInsertOrder),
+			newOrderInsertNewOrder: prepareStmt(w.cfg.Driver, ctx, s.Conn, newOrderInsertNewOrder),
 			// batch select items
 			// batch select stock for update
-			newOrderUpdateStock: prepareStmt(ctx, s.Conn, newOrderUpdateStock),
+			newOrderUpdateStock: prepareStmt(w.cfg.Driver, ctx, s.Conn, newOrderUpdateStock),
 			// batch insert order_line
 		}
 		for i := 5; i <= 15; i++ {
-			s.newOrderStmts[newOrderSelectItemSQLs[i]] = prepareStmt(ctx, s.Conn, newOrderSelectItemSQLs[i])
-			s.newOrderStmts[newOrderSelectStockSQLs[i]] = prepareStmt(ctx, s.Conn, newOrderSelectStockSQLs[i])
-			s.newOrderStmts[newOrderInsertOrderLineSQLs[i]] = prepareStmt(ctx, s.Conn, newOrderInsertOrderLineSQLs[i])
+			s.newOrderStmts[newOrderSelectItemSQLs[i]] = prepareStmt(w.cfg.Driver, ctx, s.Conn, newOrderSelectItemSQLs[i])
+			s.newOrderStmts[newOrderSelectStockSQLs[i]] = prepareStmt(w.cfg.Driver, ctx, s.Conn, newOrderSelectStockSQLs[i])
+			s.newOrderStmts[newOrderInsertOrderLineSQLs[i]] = prepareStmt(w.cfg.Driver, ctx, s.Conn, newOrderInsertOrderLineSQLs[i])
 		}
 
 		s.paymentStmts = map[string]*sql.Stmt{
-			paymentUpdateWarehouse:          prepareStmt(ctx, s.Conn, paymentUpdateWarehouse),
-			paymentSelectWarehouse:          prepareStmt(ctx, s.Conn, paymentSelectWarehouse),
-			paymentUpdateDistrict:           prepareStmt(ctx, s.Conn, paymentUpdateDistrict),
-			paymentSelectDistrict:           prepareStmt(ctx, s.Conn, paymentSelectDistrict),
-			paymentSelectCustomerListByLast: prepareStmt(ctx, s.Conn, paymentSelectCustomerListByLast),
-			paymentSelectCustomerForUpdate:  prepareStmt(ctx, s.Conn, paymentSelectCustomerForUpdate),
-			paymentSelectCustomerData:       prepareStmt(ctx, s.Conn, paymentSelectCustomerData),
-			paymentUpdateCustomerWithData:   prepareStmt(ctx, s.Conn, paymentUpdateCustomerWithData),
-			paymentUpdateCustomer:           prepareStmt(ctx, s.Conn, paymentUpdateCustomer),
-			paymentInsertHistory:            prepareStmt(ctx, s.Conn, paymentInsertHistory),
+			paymentUpdateWarehouse:          prepareStmt(w.cfg.Driver, ctx, s.Conn, paymentUpdateWarehouse),
+			paymentSelectWarehouse:          prepareStmt(w.cfg.Driver, ctx, s.Conn, paymentSelectWarehouse),
+			paymentUpdateDistrict:           prepareStmt(w.cfg.Driver, ctx, s.Conn, paymentUpdateDistrict),
+			paymentSelectDistrict:           prepareStmt(w.cfg.Driver, ctx, s.Conn, paymentSelectDistrict),
+			paymentSelectCustomerListByLast: prepareStmt(w.cfg.Driver, ctx, s.Conn, paymentSelectCustomerListByLast),
+			paymentSelectCustomerForUpdate:  prepareStmt(w.cfg.Driver, ctx, s.Conn, paymentSelectCustomerForUpdate),
+			paymentSelectCustomerData:       prepareStmt(w.cfg.Driver, ctx, s.Conn, paymentSelectCustomerData),
+			paymentUpdateCustomerWithData:   prepareStmt(w.cfg.Driver, ctx, s.Conn, paymentUpdateCustomerWithData),
+			paymentUpdateCustomer:           prepareStmt(w.cfg.Driver, ctx, s.Conn, paymentUpdateCustomer),
+			paymentInsertHistory:            prepareStmt(w.cfg.Driver, ctx, s.Conn, paymentInsertHistory),
 		}
 
 		s.orderStatusStmts = map[string]*sql.Stmt{
-			orderStatusSelectCustomerCntByLast: prepareStmt(ctx, s.Conn, orderStatusSelectCustomerCntByLast),
-			orderStatusSelectCustomerByLast:    prepareStmt(ctx, s.Conn, orderStatusSelectCustomerByLast),
-			orderStatusSelectCustomerByID:      prepareStmt(ctx, s.Conn, orderStatusSelectCustomerByID),
-			orderStatusSelectLatestOrder:       prepareStmt(ctx, s.Conn, orderStatusSelectLatestOrder),
-			orderStatusSelectOrderLine:         prepareStmt(ctx, s.Conn, orderStatusSelectOrderLine),
+			orderStatusSelectCustomerCntByLast: prepareStmt(w.cfg.Driver, ctx, s.Conn, orderStatusSelectCustomerCntByLast),
+			orderStatusSelectCustomerByLast:    prepareStmt(w.cfg.Driver, ctx, s.Conn, orderStatusSelectCustomerByLast),
+			orderStatusSelectCustomerByID:      prepareStmt(w.cfg.Driver, ctx, s.Conn, orderStatusSelectCustomerByID),
+			orderStatusSelectLatestOrder:       prepareStmt(w.cfg.Driver, ctx, s.Conn, orderStatusSelectLatestOrder),
+			orderStatusSelectOrderLine:         prepareStmt(w.cfg.Driver, ctx, s.Conn, orderStatusSelectOrderLine),
 		}
 		s.deliveryStmts = map[string]*sql.Stmt{
-			deliverySelectNewOrder:  prepareStmt(ctx, s.Conn, deliverySelectNewOrder),
-			deliveryDeleteNewOrder:  prepareStmt(ctx, s.Conn, deliveryDeleteNewOrder),
-			deliveryUpdateOrder:     prepareStmt(ctx, s.Conn, deliveryUpdateOrder),
-			deliverySelectOrders:    prepareStmt(ctx, s.Conn, deliverySelectOrders),
-			deliveryUpdateOrderLine: prepareStmt(ctx, s.Conn, deliveryUpdateOrderLine),
-			deliverySelectSumAmount: prepareStmt(ctx, s.Conn, deliverySelectSumAmount),
-			deliveryUpdateCustomer:  prepareStmt(ctx, s.Conn, deliveryUpdateCustomer),
+			deliverySelectNewOrder:  prepareStmt(w.cfg.Driver, ctx, s.Conn, deliverySelectNewOrder),
+			deliveryDeleteNewOrder:  prepareStmt(w.cfg.Driver, ctx, s.Conn, deliveryDeleteNewOrder),
+			deliveryUpdateOrder:     prepareStmt(w.cfg.Driver, ctx, s.Conn, deliveryUpdateOrder),
+			deliverySelectOrders:    prepareStmt(w.cfg.Driver, ctx, s.Conn, deliverySelectOrders),
+			deliveryUpdateOrderLine: prepareStmt(w.cfg.Driver, ctx, s.Conn, deliveryUpdateOrderLine),
+			deliverySelectSumAmount: prepareStmt(w.cfg.Driver, ctx, s.Conn, deliverySelectSumAmount),
+			deliveryUpdateCustomer:  prepareStmt(w.cfg.Driver, ctx, s.Conn, deliveryUpdateCustomer),
 		}
 		s.stockLevelStmt = map[string]*sql.Stmt{
-			stockLevelSelectDistrict: prepareStmt(ctx, s.Conn, stockLevelSelectDistrict),
-			stockLevelCount:          prepareStmt(ctx, s.Conn, stockLevelCount),
+			stockLevelSelectDistrict: prepareStmt(w.cfg.Driver, ctx, s.Conn, stockLevelSelectDistrict),
+			stockLevelCount:          prepareStmt(w.cfg.Driver, ctx, s.Conn, stockLevelCount),
 		}
 	}
 
@@ -303,7 +342,7 @@ func (w *Workloader) Run(ctx context.Context, threadID int) error {
 	}
 
 	start := time.Now()
-	err := txn.action(ctx, threadID)
+	err = txn.action(ctx, threadID)
 
 	w.rtMeasurement.Measure(txn.name, time.Now().Sub(start), err)
 
@@ -333,13 +372,14 @@ func (w *Workloader) Cleanup(ctx context.Context, threadID int) error {
 	return nil
 }
 
-func outputRtMeasurement(prefix string, opMeasurement map[string]*measurement.Histogram) {
+func outputRtMeasurement(outputStyle string, prefix string, opMeasurement map[string]*measurement.Histogram) {
 	keys := make([]string, 0, len(opMeasurement))
 	for k := range opMeasurement {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 
+	lines := [][]string{}
 	for _, op := range keys {
 		hist := opMeasurement[op]
 		if !hist.Empty() {
@@ -355,12 +395,22 @@ func outputRtMeasurement(prefix string, opMeasurement map[string]*measurement.Hi
 			p99Vec.WithLabelValues(op).Set(info.P99)
 			p999Vec.WithLabelValues(op).Set(info.P999)
 			maxVec.WithLabelValues(op).Set(info.Max)
-			fmt.Printf("%s%-6s - %s\n", prefix, op, hist.Summary())
+			line := []string{prefix, op}
+			line = append(line, hist.Summary()...)
+			lines = append(lines, line)
 		}
+	}
+	switch outputStyle {
+	case util.OutputStylePlain:
+		util.RenderString("%s%-6s - %s\n", []string{"Prefix", "Operation", "Takes(s)", "Count", "TPM", "Sum(ms)", "Avg(ms)", "50th(ms)", "90th(ms)", "95th(ms)", "99th(ms)", "99.9th(ms)", "Max(ms)"}, lines)
+	case util.OutputStyleTable:
+		util.RenderTable([]string{"Prefix", "Operation", "Takes(s)", "Count", "TPM", "Sum(ms)", "Avg(ms)", "50th(ms)", "90th(ms)", "95th(ms)", "99th(ms)", "99.9th(ms)", "Max(ms)"}, lines)
+	case util.OutputStyleJson:
+		util.RenderJson([]string{"Prefix", "Operation", "Takes(s)", "Count", "TPM", "Sum(ms)", "Avg(ms)", "50th(ms)", "90th(ms)", "95th(ms)", "99th(ms)", "99.9th(ms)", "Max(ms)"}, lines)
 	}
 }
 
-func outputWaitTimesMeasurement(prefix string, opMeasurement map[string]*measurement.Histogram) {
+func outputWaitTimesMeasurement(outputStyle string, prefix string, opMeasurement map[string]*measurement.Histogram) {
 	keys := make([]string, len(opMeasurement))
 	var i = 0
 	for k := range opMeasurement {
@@ -369,26 +419,62 @@ func outputWaitTimesMeasurement(prefix string, opMeasurement map[string]*measure
 	}
 	sort.Strings(keys)
 
+	lines := [][]string{}
 	for _, op := range keys {
 		hist := opMeasurement[op]
 		if !hist.Empty() {
-			fmt.Printf("%s%-6s - %.1fs\n", prefix, strings.ToUpper(op), float64(hist.GetInfo().Avg)/1000)
+			lines = append(lines, []string{prefix, strings.ToUpper(op), util.FloatToOneString(float64(hist.GetInfo().Avg)/1000) + "s"})
 		}
 	}
+	switch outputStyle {
+	case util.OutputStylePlain:
+		util.RenderString("%s%-6s - %s\n", nil, lines)
+	case util.OutputStyleTable:
+		util.RenderTable([]string{"Prefix", "Operation", "Avg(s)"}, lines)
+	case util.OutputStyleJson:
+		util.RenderJson([]string{"Prefix", "Operation", "Avg(s)"}, lines)
+	}
 }
+
 func (w *Workloader) OutputStats(ifSummaryReport bool) {
-	w.rtMeasurement.Output(ifSummaryReport, outputRtMeasurement)
+	w.rtMeasurement.Output(ifSummaryReport, w.cfg.OutputStyle, outputRtMeasurement)
 	if w.cfg.Wait {
-		w.waitTimeMeasurement.Output(ifSummaryReport, outputWaitTimesMeasurement)
+		w.waitTimeMeasurement.Output(ifSummaryReport, w.cfg.OutputStyle, outputWaitTimesMeasurement)
 	}
 	if ifSummaryReport {
-		hist, e := w.rtMeasurement.OpSumMeasurement["new_order"]
-		if e && !hist.Empty() {
-			result := hist.GetInfo()
+		var (
+			newOrderHist *measurement.Histogram
+			totalOps     float64
+		)
+		for name, hist := range w.rtMeasurement.OpSumMeasurement {
+			if name == "new_order" {
+				newOrderHist = hist
+			}
+			if !strings.HasSuffix(name, "_ERR") {
+				totalOps += hist.GetInfo().Ops
+			}
+		}
+		if newOrderHist != nil && !newOrderHist.Empty() {
+			result := newOrderHist.GetInfo()
 			const specWarehouseFactor = 12.86
 			tpmC := result.Ops * 60
+			tpmTotal := totalOps * 60
 			efc := 100 * tpmC / (specWarehouseFactor * float64(w.cfg.Warehouses))
-			fmt.Printf("tpmC: %.1f, efficiency: %.1f%%\n", tpmC, efc)
+			lines := [][]string{
+				{
+					util.FloatToOneString(tpmC),
+					util.FloatToOneString(tpmTotal),
+					util.FloatToOneString(efc) + "%",
+				},
+			}
+			switch w.cfg.OutputStyle {
+			case util.OutputStylePlain:
+				util.RenderString("tpmC: %s, tpmTotal: %s, efficiency: %s\n", nil, lines)
+			case util.OutputStyleTable:
+				util.RenderTable([]string{"tpmC", "tpmTotal", "efficiency"}, lines)
+			case util.OutputStyleJson:
+				util.RenderJson([]string{"tpmC", "tpmTotal", "efficiency"}, lines)
+			}
 		}
 	}
 }
@@ -406,21 +492,22 @@ func (w *Workloader) beginTx(ctx context.Context) (*sql.Tx, error) {
 	return tx, err
 }
 
-func prepareStmts(ctx context.Context, conn *sql.Conn, queries []string) []*sql.Stmt {
+func prepareStmts(driver string, ctx context.Context, conn *sql.Conn, queries []string) []*sql.Stmt {
 	stmts := make([]*sql.Stmt, len(queries))
 	for i, query := range queries {
 		if len(query) == 0 {
 			continue
 		}
-		stmts[i] = prepareStmt(ctx, conn, query)
+		stmts[i] = prepareStmt(driver, ctx, conn, query)
 	}
 
 	return stmts
 }
 
-func prepareStmt(ctx context.Context, conn *sql.Conn, query string) *sql.Stmt {
-	stmt, err := conn.PrepareContext(ctx, query)
+func prepareStmt(driver string, ctx context.Context, conn *sql.Conn, query string) *sql.Stmt {
+	stmt, err := conn.PrepareContext(ctx, convertToPQ(query, driver))
 	if err != nil {
+		fmt.Println(fmt.Sprintf("prepare statement error: %s", query))
 		panic(err)
 	}
 	return stmt
@@ -433,4 +520,20 @@ func closeStmts(stmts map[string]*sql.Stmt) {
 		}
 		stmt.Close()
 	}
+}
+
+func (w *Workloader) IsPlanReplayerDumpEnabled() bool {
+	return false
+}
+
+func (w *Workloader) PreparePlanReplayerDump() error {
+	return nil
+}
+
+func (w *Workloader) FinishPlanReplayerDump() error {
+	return nil
+}
+
+func (w *Workloader) Exec(sql string) error {
+	return nil
 }

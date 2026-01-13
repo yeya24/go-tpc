@@ -4,12 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/pingcap/go-tpc/pkg/measurement"
+	replayer "github.com/pingcap/go-tpc/pkg/plan-replayer"
 	"github.com/pingcap/go-tpc/pkg/util"
 	"github.com/pingcap/go-tpc/pkg/workload"
 )
@@ -24,6 +24,11 @@ type Config struct {
 	QueryNames         []string
 	ExecExplainAnalyze bool
 	RefreshWait        time.Duration
+
+	// output style
+	OutputStyle        string
+	EnablePlanReplayer bool
+	PlanReplayerConfig replayer.PlanReplayerConfig
 }
 
 type rawsqlState struct {
@@ -36,6 +41,8 @@ type Workloader struct {
 	db  *sql.DB
 
 	measurement *measurement.Measurement
+
+	PlanReplayerRunner *replayer.PlanReplayerRunner
 }
 
 var _ workload.Workloader = &Workloader{}
@@ -94,6 +101,11 @@ func (w *Workloader) Run(ctx context.Context, threadID int) error {
 
 	queryName := w.cfg.QueryNames[s.queryIdx%len(w.cfg.QueryNames)]
 	query := w.cfg.Queries[queryName]
+
+	if w.cfg.EnablePlanReplayer {
+		w.dumpPlanReplayer(ctx, s, query, queryName)
+	}
+
 	if w.cfg.ExecExplainAnalyze {
 		query = "explain analyze\n" + query
 	}
@@ -109,7 +121,7 @@ func (w *Workloader) Run(ctx context.Context, threadID int) error {
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(os.Stderr, "explain analyze result of query %s:\n%s\n", queryName, table)
+		util.StdErrLogger.Printf("explain analyze result of query %s:\n%s\n", queryName, table)
 		return nil
 	}
 
@@ -117,7 +129,7 @@ func (w *Workloader) Run(ctx context.Context, threadID int) error {
 	return nil
 }
 
-func outputMeasurement(prefix string, opMeasurement map[string]*measurement.Histogram) {
+func outputMeasurement(outputStyle string, prefix string, opMeasurement map[string]*measurement.Histogram) {
 	keys := make([]string, len(opMeasurement))
 	var i = 0
 	for k := range opMeasurement {
@@ -126,16 +138,26 @@ func outputMeasurement(prefix string, opMeasurement map[string]*measurement.Hist
 	}
 	sort.Strings(keys)
 
+	lines := [][]string{}
 	for _, op := range keys {
 		hist := opMeasurement[op]
 		if !hist.Empty() {
-			fmt.Printf("%s%s: %.2fs\n", prefix, strings.ToUpper(op), float64(hist.GetInfo().Avg)/1000)
+			lines = append(lines, []string{prefix, strings.ToUpper(op), util.FloatToTwoString(float64(hist.GetInfo().Avg)/1000) + "s"})
 		}
+	}
+
+	switch outputStyle {
+	case util.OutputStylePlain:
+		util.RenderString("%s%s: %s\n", nil, lines)
+	case util.OutputStyleTable:
+		util.RenderTable([]string{"Prefix", "Operation", "Avg(s)"}, lines)
+	case util.OutputStyleJson:
+		util.RenderJson([]string{"Prefix", "Operation", "Avg(s)"}, lines)
 	}
 }
 
 func (w *Workloader) OutputStats(ifSummaryReport bool) {
-	w.measurement.Output(ifSummaryReport, outputMeasurement)
+	w.measurement.Output(ifSummaryReport, w.cfg.OutputStyle, outputMeasurement)
 }
 
 func (w *Workloader) DBName() string {
@@ -157,4 +179,34 @@ func (w *Workloader) Cleanup(ctx context.Context, threadID int) error {
 
 func (w *Workloader) Check(ctx context.Context, threadID int) error {
 	panic("not implemented") // TODO: Implement
+}
+
+func (w *Workloader) dumpPlanReplayer(ctx context.Context, s *rawsqlState, query, queryName string) {
+	query = "plan replayer dump explain " + query
+	err := w.PlanReplayerRunner.Dump(ctx, s.Conn, query, queryName)
+	if err != nil {
+		fmt.Printf("dump query %s plan replayer failed %v", queryName, err)
+	}
+}
+
+func (w *Workloader) IsPlanReplayerDumpEnabled() bool {
+	return w.cfg.EnablePlanReplayer
+}
+
+func (w *Workloader) PreparePlanReplayerDump() error {
+	w.cfg.PlanReplayerConfig.WorkloadName = w.Name()
+	if w.PlanReplayerRunner == nil {
+		w.PlanReplayerRunner = &replayer.PlanReplayerRunner{
+			Config: w.cfg.PlanReplayerConfig,
+		}
+	}
+	return w.PlanReplayerRunner.Prepare()
+}
+
+func (w *Workloader) FinishPlanReplayerDump() error {
+	return w.PlanReplayerRunner.Finish()
+}
+
+func (w *Workloader) Exec(sql string) error {
+	return nil
 }

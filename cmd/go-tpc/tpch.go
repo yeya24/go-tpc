@@ -2,37 +2,100 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 
-	"github.com/spf13/cobra"
-
+	"github.com/pingcap/go-tpc/pkg/util"
 	"github.com/pingcap/go-tpc/tpch"
+	"github.com/spf13/cobra"
 )
 
 var tpchConfig tpch.Config
+
+var queryTuningVars = []struct {
+	name  string
+	value string
+}{
+	// For optimal join order, esp. for q9.
+	{"tidb_default_string_match_selectivity", "0.1"},
+	// For optimal join order for all queries.
+	{"tidb_opt_join_reorder_threshold", "60"},
+	// For optimal join type between broadcast and hash partition join.
+	{"tidb_prefer_broadcast_join_by_exchange_data_size", "ON"},
+}
+
+// isSysVarSupported determines if a system variable is supported in given TiDB version
+// TODO: Every known sys var should have a minimal supported version and be checked individually. For now we just assume all sys vars are supported since 7.1.0.
+func isSysVarSupported(ver util.SemVersion, sysVar string) bool {
+	return ver.Compare(util.SemVersion{Major: 7, Minor: 1, Patch: 0}) >= 0
+}
 
 func executeTpch(action string) {
 	openDB()
 	defer closeDB()
 
 	if globalDB == nil {
-		fmt.Fprintln(os.Stderr, "cannot connect to the database")
+		util.StdErrLogger.Printf("cannot connect to the database")
 		os.Exit(1)
 	}
+	if maxProcs != 0 {
+		runtime.GOMAXPROCS(maxProcs)
+	}
 
+	if action == "run" && driver == mysqlDriver && tpchConfig.EnableQueryTuning {
+		serverVer, err := getServerVersion(globalDB)
+		if err != nil {
+			panic(fmt.Errorf("get server version failed: %v", err))
+		}
+		fmt.Printf("Server version: %s\n", serverVer)
+
+		if semVer, ok := util.NewTiDBSemVersion(serverVer); ok {
+			fmt.Printf("Enabling query tuning for TiDB version %s.\n", semVer.String())
+			if err := setTiDBQueryTuningVars(globalDB, semVer); err != nil {
+				panic(fmt.Errorf("set session variables failed: %v", err))
+			}
+		} else {
+			fmt.Printf("Query tuning is enabled(by default) but server version doesn't appear to be TiDB, skipping tuning.\n")
+		}
+	}
+
+	tpchConfig.PlanReplayerConfig.Host = hosts[0]
+	tpchConfig.PlanReplayerConfig.StatusPort = statusPort
+
+	tpchConfig.OutputStyle = outputStyle
+	tpchConfig.Driver = driver
 	tpchConfig.DBName = dbName
 	tpchConfig.PrepareThreads = threads
 	tpchConfig.QueryNames = strings.Split(tpchConfig.RawQueries, ",")
 	w := tpch.NewWorkloader(globalDB, &tpchConfig)
-
 	timeoutCtx, cancel := context.WithTimeout(globalCtx, totalTime)
 	defer cancel()
 
 	executeWorkload(timeoutCtx, w, threads, action)
 	fmt.Println("Finished")
 	w.OutputStats(true)
+}
+
+func getServerVersion(db *sql.DB) (string, error) {
+	var version string
+	err := db.QueryRow("SELECT VERSION()").Scan(&version)
+	return version, err
+}
+
+func setTiDBQueryTuningVars(db *sql.DB, ver util.SemVersion) error {
+	for _, v := range queryTuningVars {
+		if isSysVarSupported(ver, v.name) {
+			if _, err := db.Exec(fmt.Sprintf("SET SESSION %s = %s", v.name, v.value)); err != nil {
+				return err
+			}
+		} else {
+			fmt.Printf("Unsupported query tunning var %s for TiDB version %s \n", v.name, ver.String())
+		}
+	}
+	return nil
 }
 
 func registerTpch(root *cobra.Command) {
@@ -68,10 +131,10 @@ func registerTpch(root *cobra.Command) {
 		},
 	}
 
-	cmdPrepare.PersistentFlags().BoolVar(&tpchConfig.CreateTiFlashReplica,
-		"tiflash",
-		false,
-		"Create tiflash replica")
+	cmdPrepare.PersistentFlags().IntVar(&tpchConfig.TiFlashReplica,
+		"tiflash-replica",
+		0,
+		"Number of tiflash replica")
 
 	cmdPrepare.PersistentFlags().BoolVar(&tpchConfig.AnalyzeTable.Enable,
 		"analyze",
@@ -106,6 +169,26 @@ func registerTpch(root *cobra.Command) {
 			executeTpch("run")
 		},
 	}
+
+	cmdRun.PersistentFlags().BoolVar(&tpchConfig.EnablePlanReplayer,
+		"use-plan-replayer",
+		false,
+		"Use Plan Replayer to dump stats and variables before running queries")
+
+	cmdRun.PersistentFlags().StringVar(&tpchConfig.PlanReplayerConfig.PlanReplayerDir,
+		"plan-replayer-dir",
+		"",
+		"Dir of Plan Replayer file dumps")
+
+	cmdRun.PersistentFlags().StringVar(&tpchConfig.PlanReplayerConfig.PlanReplayerFileName,
+		"plan-replayer-file",
+		"",
+		"Name of plan Replayer file dumps")
+
+	cmdRun.PersistentFlags().BoolVar(&tpchConfig.EnableQueryTuning,
+		"enable-query-tuning",
+		true,
+		"Tune queries by setting some session variables known effective for tpch")
 
 	var cmdCleanup = &cobra.Command{
 		Use:   "cleanup",

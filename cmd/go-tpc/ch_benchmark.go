@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"os"
 	"runtime"
@@ -17,6 +18,11 @@ import (
 )
 
 var chConfig ch.Config
+var (
+	apConnParams string
+	apHosts      []string
+	apPorts      []int
+)
 
 func registerCHBenchmark(root *cobra.Command) {
 	cmd := &cobra.Command{
@@ -35,13 +41,13 @@ func registerCHBenchmark(root *cobra.Command) {
 		Use:   "prepare",
 		Short: "Prepare data for the workload",
 		Run: func(cmd *cobra.Command, args []string) {
-			executeCH("prepare")
+			executeCH("prepare", nil)
 		},
 	}
-	cmdPrepare.PersistentFlags().BoolVar(&chConfig.CreateTiFlashReplica,
-		"tiflash",
-		false,
-		"Create tiflash replica")
+	cmdPrepare.PersistentFlags().IntVar(&chConfig.TiFlashReplica,
+		"tiflash-replica",
+		0,
+		"Number of tiflash replica")
 
 	cmdPrepare.PersistentFlags().BoolVar(&chConfig.AnalyzeTable.Enable,
 		"analyze",
@@ -64,36 +70,104 @@ func registerCHBenchmark(root *cobra.Command) {
 	var cmdRun = &cobra.Command{
 		Use:   "run",
 		Short: "Run workload",
+		PreRun: func(cmd *cobra.Command, args []string) {
+			if len(apConnParams) == 0 {
+				apConnParams = connParams
+			}
+			if len(apHosts) == 0 {
+				apHosts = hosts
+			}
+			if len(apPorts) == 0 {
+				apPorts = ports
+			}
+		},
 		Run: func(cmd *cobra.Command, _ []string) {
-			executeCH("run")
+			executeCH("run", func() (*sql.DB, error) {
+				return newDB(makeTargets(apHosts, apPorts), driver, user, password, dbName, apConnParams)
+			})
 		},
 	}
+	cmdRun.PersistentFlags().BoolVar(&chConfig.EnablePlanReplayer,
+		"use-plan-replayer",
+		false,
+		"Use Plan Replayer to dump stats and variables before running queries")
+
+	cmdRun.PersistentFlags().StringVar(&chConfig.PlanReplayerConfig.PlanReplayerDir,
+		"plan-replayer-dir",
+		"",
+		"Dir of Plan Replayer file dumps")
+
+	cmdRun.PersistentFlags().StringVar(&chConfig.PlanReplayerConfig.PlanReplayerFileName,
+		"plan-replayer-file",
+		"",
+		"Name of plan Replayer file dumps")
+
+	cmdRun.PersistentFlags().BoolVar(&chConfig.ExecExplainAnalyze,
+		"use-explain",
+		false,
+		"execute explain analyze")
+
+	cmdRun.PersistentFlags().IntSliceVar(&tpccConfig.Weight, "weight", []int{45, 43, 4, 4, 4}, "Weight for NewOrder, Payment, OrderStatus, Delivery, StockLevel")
+	cmdRun.Flags().DurationVar(&tpccConfig.ConnRefreshInterval, "conn-refresh-interval", 0, "automatically refresh database connections at specified intervals to balance traffic across new replicas (0 = disabled, e.g., 10s)")
+	cmdRun.Flags().StringVar(&apConnParams, "ap-conn-params", "", "Connection parameters for analytical processing")
+	cmdRun.Flags().StringSliceVar(&apHosts, "ap-host", nil, "Database host for analytical processing")
+	cmdRun.Flags().IntSliceVar(&apPorts, "ap-port", nil, "Database port for analytical processing")
+
 	cmd.AddCommand(cmdRun, cmdPrepare)
 	root.AddCommand(cmd)
 }
 
-func executeCH(action string) {
-	runtime.GOMAXPROCS(maxProcs)
+func executeCH(action string, openAP func() (*sql.DB, error)) {
+	if maxProcs != 0 {
+		runtime.GOMAXPROCS(maxProcs)
+	}
 
 	openDB()
 	defer closeDB()
 
+	tpccConfig.OutputStyle = outputStyle
+	tpccConfig.Driver = driver
 	tpccConfig.DBName = dbName
 	tpccConfig.Threads = threads
 	tpccConfig.Isolation = isolationLevel
+	chConfig.OutputStyle = outputStyle
+	chConfig.Driver = driver
 	chConfig.DBName = dbName
 	chConfig.QueryNames = strings.Split(chConfig.RawQueries, ",")
+	if action == "run" {
+		chConfig.PlanReplayerConfig.Host = apHosts[0]
+	} else {
+		chConfig.PlanReplayerConfig.Host = hosts[0]
+	}
+	chConfig.PlanReplayerConfig.StatusPort = statusPort
 
 	var (
 		tp, ap workload.Workloader
 		err    error
 	)
+
+	// Set a reasonable connection max lifetime when auto-refresh is enabled
+	// This ensures connections are actually closed and not just returned to pool
+	if tpccConfig.ConnRefreshInterval > 0 {
+		globalDB.SetConnMaxLifetime(tpccConfig.ConnRefreshInterval)
+		fmt.Printf("Auto-setting connection max lifetime to %v (refresh interval)\n", tpccConfig.ConnRefreshInterval)
+	}
 	tp, err = tpcc.NewWorkloader(globalDB, &tpccConfig)
 	if err != nil {
 		fmt.Printf("Failed to init tp work loader: %v\n", err)
 		os.Exit(1)
 	}
-	ap = ch.NewWorkloader(globalDB, &chConfig)
+	if openAP == nil {
+		ap = ch.NewWorkloader(globalDB, &chConfig)
+	} else {
+		db, err := openAP()
+		if err != nil {
+			fmt.Printf("Failed to open db for analytical processing: %v\n", err)
+			os.Exit(1)
+		}
+		db.SetMaxIdleConns(acThreads + 1)
+		ap = ch.NewWorkloader(db, &chConfig)
+	}
 	if err != nil {
 		fmt.Printf("Failed to init tp work loader: %v\n", err)
 		os.Exit(1)
